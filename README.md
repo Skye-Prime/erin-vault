@@ -32,8 +32,10 @@ Requires Python 3.9+ and the `cryptography` package. macOS or Linux.
 # Store a credential (hidden prompts, double-entry confirm)
 erin-vault store apple-id --username you@example.com
 
-# Or store it from your phone: prints a URL + 6-digit PIN,
-# localhost-only, one submission, 10-minute expiry
+# Or store it from your phone: prints a URL + one-time encryption code.
+# The page encrypts the password in your browser BEFORE it travels —
+# a network listener sees only ciphertext. Localhost-only, one
+# submission, 10-minute expiry.
 erin-vault serve-store apple-id
 
 # See what's stored (names only, never values)
@@ -60,7 +62,9 @@ the script — extend it with your own tools' prompts.
   master key (macOS Keychain, or a `0600` file) **never leave the machine**.
 - The script makes **zero outbound network connections**. The only socket it
   ever opens is the optional `serve-store` listener, which binds `127.0.0.1`
-  by default.
+  by default — and `serve-store` is **end-to-end encrypted**: the password is
+  encrypted in the browser (PBKDF2-SHA256 → AES-256-GCM) with a one-time
+  code before it travels, so even a network listener sees only ciphertext.
 - See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for what it protects
   against — and what it doesn't.
 

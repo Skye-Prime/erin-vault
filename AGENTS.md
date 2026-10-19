@@ -28,7 +28,7 @@ before you ever see them. You never see, log, or store the secrets.
 2. `chmod +x` it and make sure its directory is on `PATH`.
    (Or just run `./install.sh` — it does all of the above.)
 3. Verify:
-   - `erin-vault --version` → `erin-vault 1.0.0`
+   - `erin-vault --version` → `erin-vault 1.1.0`
    - `erin-vault list` → `No credentials stored.`
    - The first *write* creates the master key. Confirm the directory is
      `~/.erin-vault` with `700` permissions.
@@ -40,12 +40,17 @@ Pick the method that fits the human:
 - **Sitting at the machine:** `erin-vault store <name> [--username user@example.com]`
   Hidden prompts, double-entry confirmation. Nothing is echoed.
 - **From a phone or another device:** `erin-vault serve-store <name>`
-  Prints `VAULT_URL:` and `VAULT_PIN:`. Relay both to the human; they open
-  the URL, type the secret into the form, done. The server binds
-  **localhost only** by default and shuts down after one submission or
-  10 minutes. If the human's browser is on a *different* device on a
-  private mesh network (e.g. Tailscale), re-run with
-  `--bind <this-machine's-private-IP>`.
+  Prints `VAULT_URL:` and `VAULT_CODE:`. Relay both to the human; they open
+  the URL, type the **encryption code** into the form along with the secret,
+  and the page **encrypts the password in their browser before anything
+  travels** (PBKDF2-SHA256 600k → AES-256-GCM; a verified ChaCha20-Poly1305
+  fallback covers browsers without WebCrypto). A network listener sees only
+  ciphertext — the code itself travels via your chat, a separate channel.
+  The server binds **localhost only** by default and shuts down after one
+  submission, 25 failed attempts, or 10 minutes. If the human's browser is
+  on a *different* device on a private mesh network (e.g. Tailscale),
+  re-run with `--bind <this-machine's-private-IP>` — the mesh's own
+  encryption then adds a second layer.
 - Then run `erin-vault list` to confirm the *name* is stored. You will never
   see the value — that is the point.
 

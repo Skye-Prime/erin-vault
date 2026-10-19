@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ERIN Vault v1.0.0 — local-only encrypted credential broker for AI agents.
+ERIN Vault v1.1.0 — local-only encrypted credential broker for AI agents.
 
 The problem: your AI agent needs to run authenticated commands (log in to
 developer accounts, sign builds, hit private APIs), but you don't want to
@@ -17,13 +17,14 @@ Commands:
         Store a credential via hidden terminal prompts (double-entry confirm).
 
     erin-vault serve-store <name> [--port P] [--bind ADDR]
-        One-time local web form for credential entry from another device.
-        Prints a URL + 6-digit PIN; hand both to your agent, or open the URL
-        yourself. The value goes straight into the encrypted vault; the server
-        shuts down after one submission or 10 minutes. Binds 127.0.0.1
-        (localhost) by default — nothing leaves the machine. To enter from a
-        phone, re-run with --bind set to this machine's private-network IP
-        (e.g. its Tailscale address).
+        One-time local web form for credential entry from another device,
+        with END-TO-END encryption: the page encrypts the password in the
+        browser (PBKDF2-SHA256 600k -> AES-256-GCM, or ChaCha20-Poly1305
+        fallback) using an encryption code the vault prints. Anyone listening
+        on the network sees only ciphertext. Binds 127.0.0.1 (localhost) by
+        default — nothing leaves the machine. To enter from a phone, re-run
+        with --bind set to this machine's private-network IP (e.g. its
+        Tailscale address; the WireGuard tunnel then adds a second layer).
 
     erin-vault list
         List stored credential names (never values).
@@ -42,6 +43,10 @@ the master key (macOS Keychain, or a 0600 file elsewhere) never leave this
 machine. This script makes zero outbound network connections — the only
 socket it ever opens is the optional serve-store listener, which defaults to
 localhost. See docs/THREAT_MODEL.md.
+
+Open design: this repo is public, and that does not weaken it. Security
+rests on random per-install keys (Fernet master key, per-submit salts/IVs,
+the one-time encryption code) — never on secret logic. See THREAT_MODEL.md.
 """
 
 import base64
@@ -54,7 +59,7 @@ import select
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 VAULT_DIR = os.path.expanduser("~/.erin-vault")
 VAULT_FILE = os.path.join(VAULT_DIR, "vault.enc")
@@ -62,6 +67,16 @@ KEY_FILE = os.path.join(VAULT_DIR, ".master-key")
 KEYCHAIN_SERVICE = "erin-vault"
 KEYCHAIN_ACCOUNT = "master-key"
 TWOFA_MARKER = "/tmp/erin-vault-2fa-needed"
+
+# --- serve-store end-to-end encryption parameters ---
+# Unambiguous alphabet (no 0/o/1/l); 12 chars -> ~60 bits of entropy.
+CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+CODE_LEN = 12
+PBKDF2_ITERS = 600_000
+AAD_PREFIX = b"erin-vault/serve-store/v1:"
+SERVE_TIMEOUT_SECS = 600
+SERVE_MAX_FAILS = 25
+SUITES = ("aesgcm-v1", "chacha-v1")
 
 # App-specific prompt handlers: (regex, reply, note).
 # Checked in order, each fires at most once per `run` invocation, before the
@@ -77,6 +92,454 @@ EXTRA_PROMPT_HANDLERS = [
     (r"would you like to reuse the original profile", "y",
      "EAS: reuse original provisioning profile"),
 ]
+
+
+# =====================================================================
+# Vendored browser crypto (fallback when WebCrypto is unavailable, i.e.
+# plain HTTP to a non-localhost host). SHA-256, HMAC-SHA256,
+# PBKDF2-HMAC-SHA256, ChaCha20-Poly1305 (IETF, RFC 8439).
+# VERIFIED against Python's `cryptography` library with fixed test vectors
+# (node harness). The page runs a self-test on load and FAILS CLOSED.
+# =====================================================================
+_VCRYPT_JS = """/* ERIN Vault vendored crypto — fallback for pages without WebCrypto
+ * (plain HTTP to a non-localhost host). Primitives: SHA-256, HMAC-SHA-256,
+ * PBKDF2-HMAC-SHA256, ChaCha20-Poly1305 (IETF, RFC 8439).
+ *
+ * These are VERIFIED against Python's `cryptography` library with fixed
+ * test vectors (see SELF_TEST_VECTORS below and the node test harness).
+ * The page runs selfTest() on load and FAILS CLOSED: the submit button
+ * stays disabled unless every vector passes.
+ */
+
+"use strict";
+
+// ---------- byte helpers ----------
+function va_ascii(s) {
+  const b = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xff;
+  return b;
+}
+function va_hexBytes(h) {
+  const b = new Uint8Array(h.length / 2);
+  for (let i = 0; i < b.length; i++) b[i] = parseInt(h.substr(i * 2, 2), 16);
+  return b;
+}
+function va_bytesHex(b) {
+  let s = "";
+  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, "0");
+  return s;
+}
+function va_concat(parts) {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const o = new Uint8Array(n);
+  let off = 0;
+  for (const p of parts) { o.set(p, off); off += p.length; }
+  return o;
+}
+function va_eq(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i];
+  return d === 0;
+}
+function va_random(n) {
+  const o = new Uint8Array(n);
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+    crypto.getRandomValues(o);
+  } else {
+    for (let i = 0; i < n; i++) o[i] = (Math.random() * 256) | 0;
+  }
+  return o;
+}
+
+// ---------- SHA-256 ----------
+const VA_K256 = [
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+];
+function va_sha256(msg) {
+  let h0=0x6a09e667,h1=0xbb67ae85,h2=0x3c6ef372,h3=0xa54ff53a,
+      h4=0x510e527f,h5=0x9b05688c,h6=0x1f83d9ab,h7=0x5be0cd19;
+  const ml = msg.length;
+  const bitLenHi = Math.floor(ml / 0x20000000), bitLenLo = (ml << 3) >>> 0;
+  const padded = new Uint8Array((((ml + 8) >> 6) + 1) << 6);
+  padded.set(msg);
+  padded[ml] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 8, bitLenHi, false);
+  dv.setUint32(padded.length - 4, bitLenLo, false);
+  const w = new Uint32Array(64);
+  for (let off = 0; off < padded.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = ((w[i-15]>>>7)|(w[i-15]<<25))^((w[i-15]>>>18)|(w[i-15]<<14))^(w[i-15]>>>3);
+      const s1 = ((w[i-2]>>>17)|(w[i-2]<<15))^((w[i-2]>>>19)|(w[i-2]<<13))^(w[i-2]>>>10);
+      w[i] = (w[i-16]+s0+w[i-7]+s1)>>>0;
+    }
+    let a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
+    for (let i = 0; i < 64; i++) {
+      const S1=((e>>>6)|(e<<26))^((e>>>11)|(e<<21))^((e>>>25)|(e<<7));
+      const ch=(e&f)^(~e&g);
+      const t1=(h+S1+ch+VA_K256[i]+w[i])>>>0;
+      const S0=((a>>>2)|(a<<30))^((a>>>13)|(a<<19))^((a>>>22)|(a<<10));
+      const maj=(a&b)^(a&c)^(b&c);
+      const t2=(S0+maj)>>>0;
+      h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;
+    }
+    h0=(h0+a)>>>0;h1=(h1+b)>>>0;h2=(h2+c)>>>0;h3=(h3+d)>>>0;
+    h4=(h4+e)>>>0;h5=(h5+f)>>>0;h6=(h6+g)>>>0;h7=(h7+h)>>>0;
+  }
+  const out = new Uint8Array(32), ov = new DataView(out.buffer);
+  [h0,h1,h2,h3,h4,h5,h6,h7].forEach((v,i)=>ov.setUint32(i*4,v,false));
+  return out;
+}
+
+// ---------- HMAC-SHA256 / PBKDF2 ----------
+function va_hmacSha256(key, msg) {
+  const B = 64;
+  if (key.length > B) key = va_sha256(key);
+  const kp = new Uint8Array(B); kp.set(key);
+  const ipad = new Uint8Array(B), opad = new Uint8Array(B);
+  for (let i = 0; i < B; i++) { ipad[i] = kp[i]^0x36; opad[i] = kp[i]^0x5c; }
+  return va_sha256(va_concat([opad, va_sha256(va_concat([ipad, msg]))]));
+}
+function va_pbkdf2(password, salt, iters, dkLen) {
+  const hLen = 32, blocks = Math.ceil(dkLen / hLen);
+  const out = new Uint8Array(blocks * hLen);
+  const ib = new Uint8Array(4), ibv = new DataView(ib.buffer);
+  for (let b = 1; b <= blocks; b++) {
+    ibv.setUint32(0, b, false);
+    let u = va_hmacSha256(password, va_concat([salt, ib]));
+    const t = u.slice();
+    for (let i = 1; i < iters; i++) {
+      u = va_hmacSha256(password, u);
+      for (let j = 0; j < hLen; j++) t[j] ^= u[j];
+    }
+    out.set(t, (b-1)*hLen);
+  }
+  return out.slice(0, dkLen);
+}
+
+// ---------- ChaCha20 ----------
+function va_chacha20Block(key, counter, nonce) {
+  const st = new Uint32Array(16);
+  st[0]=0x61707865; st[1]=0x3320646e; st[2]=0x79622d32; st[3]=0x6b206574;
+  const kv = new DataView(key.buffer, key.byteOffset, 32);
+  for (let i=0;i<8;i++) st[4+i]=kv.getUint32(i*4,true);
+  st[12]=counter>>>0;
+  const nv = new DataView(nonce.buffer, nonce.byteOffset, 12);
+  st[13]=nv.getUint32(0,true); st[14]=nv.getUint32(4,true); st[15]=nv.getUint32(8,true);
+  const w = st.slice();
+  const rotl=(v,n)=>((v<<n)|(v>>>(32-n)))>>>0;
+  const qr=(a,b,c,d)=>{
+    w[a]=(w[a]+w[b])>>>0; w[d]=rotl(w[d]^w[a],16);
+    w[c]=(w[c]+w[d])>>>0; w[b]=rotl(w[b]^w[c],12);
+    w[a]=(w[a]+w[b])>>>0; w[d]=rotl(w[d]^w[a],8);
+    w[c]=(w[c]+w[d])>>>0; w[b]=rotl(w[b]^w[c],7);
+  };
+  for(let i=0;i<10;i++){
+    qr(0,4,8,12);qr(1,5,9,13);qr(2,6,10,14);qr(3,7,11,15);
+    qr(0,5,10,15);qr(1,6,11,12);qr(2,7,8,13);qr(3,4,9,14);
+  }
+  const out=new Uint8Array(64), ov=new DataView(out.buffer);
+  for(let i=0;i<16;i++) ov.setUint32(i*4,(st[i]+w[i])>>>0,true);
+  return out;
+}
+function va_chacha20Xor(key, nonce, counter, data) {
+  const out = new Uint8Array(data.length);
+  let off=0, c=counter>>>0;
+  while(off<data.length){
+    const ks=va_chacha20Block(key,c,nonce); c=(c+1)>>>0;
+    const n=Math.min(64,data.length-off);
+    for(let i=0;i<n;i++) out[off+i]=data[off+i]^ks[i];
+    off+=n;
+  }
+  return out;
+}
+
+// ---------- Poly1305 (BigInt) ----------
+const VA_P1305 = (1n<<130n)-5n;
+function va_leToBig(b){ let v=0n; for(let i=b.length-1;i>=0;i--) v=(v<<8n)|BigInt(b[i]); return v; }
+function va_bigToLe(v,n){ const o=new Uint8Array(n); for(let i=0;i<n;i++){ o[i]=Number(v&0xffn); v>>=8n; } return o; }
+function va_poly1305Mac(key32, msg){
+  const r = va_leToBig(key32.slice(0,16)) & 0x0ffffffc0ffffffc0ffffffc0fffffffn;
+  const s = va_leToBig(key32.slice(16,32));
+  let acc = 0n;
+  for(let off=0; off<msg.length; off+=16){
+    const chunk = msg.slice(off, off+16);
+    const n = va_leToBig(chunk) + (1n << (8n*BigInt(chunk.length)));
+    acc = ((acc + n) * r) % VA_P1305;
+  }
+  return va_bigToLe((acc + s) % (1n<<128n), 16);
+}
+
+// ---------- ChaCha20-Poly1305 AEAD (IETF, RFC 8439 2.8) ----------
+function va_pad16(len){ return new Uint8Array((16-(len%16))%16); }
+function va_le64(n){
+  const o=new Uint8Array(8), v=new DataView(o.buffer);
+  v.setUint32(0, n>>>0, true);
+  v.setUint32(4, Math.floor(n/4294967296), true);
+  return o;
+}
+function va_aeadEncrypt(key, nonce12, aad, pt){
+  const otk = va_chacha20Block(key, 0, nonce12).slice(0,32);
+  const ct = va_chacha20Xor(key, nonce12, 1, pt);
+  const macData = va_concat([aad, va_pad16(aad.length), ct, va_pad16(ct.length), va_le64(aad.length), va_le64(ct.length)]);
+  const tag = va_poly1305Mac(otk, macData);
+  return {ct, tag};
+}
+function va_aeadDecrypt(key, nonce12, aad, ct, tag){
+  const otk = va_chacha20Block(key, 0, nonce12).slice(0,32);
+  const macData = va_concat([aad, va_pad16(aad.length), ct, va_pad16(ct.length), va_le64(aad.length), va_le64(ct.length)]);
+  if(!va_eq(va_poly1305Mac(otk, macData), tag)) return null;
+  return va_chacha20Xor(key, nonce12, 1, ct);
+}
+
+// ---------- base64 ----------
+const VA_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function va_b64encode(b){
+  let s="";
+  for(let i=0;i<b.length;i+=3){
+    const a=b[i], bb=i+1<b.length?b[i+1]:0, c=i+2<b.length?b[i+2]:0;
+    const n=(a<<16)|(bb<<8)|c;
+    s+=VA_B64[(n>>18)&63]+VA_B64[(n>>12)&63]+(i+1<b.length?VA_B64[(n>>6)&63]:"=")+(i+2<b.length?VA_B64[n&63]:"=");
+  }
+  return s;
+}
+function va_b64decode(s){
+  s=s.replace(/[^A-Za-z0-9+/=]/g,"");
+  const out=[];
+  for(let i=0;i<s.length;i+=4){
+    const n=(VA_B64.indexOf(s[i])<<18)|(VA_B64.indexOf(s[i+1])<<12)|((s[i+2]==="=")?0:VA_B64.indexOf(s[i+2])<<6)|((s[i+3]==="=")?0:VA_B64.indexOf(s[i+3]));
+    out.push((n>>16)&255,(n>>8)&255,n&255);
+  }
+  let len=out.length;
+  if(s.endsWith("==")) len-=2; else if(s.endsWith("=")) len-=1;
+  return new Uint8Array(out.slice(0,len));
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { va_ascii, va_hexBytes, va_bytesHex, va_concat, va_eq, va_random,
+    va_sha256, va_hmacSha256, va_pbkdf2, va_chacha20Block, va_chacha20Xor,
+    va_poly1305Mac, va_aeadEncrypt, va_aeadDecrypt, va_b64encode, va_b64decode };
+}
+"""
+
+
+# =====================================================================
+# serve-store page logic: self-test, E2E encrypt, submit.
+# __CRED_NAME_JS__ is replaced with the JSON-encoded credential name.
+# =====================================================================
+_PAGE_JS = """
+/* ERIN Vault serve-store page logic.
+ * The password NEVER leaves this browser in plaintext. It is encrypted with
+ * a key derived (PBKDF2-SHA256, 600k iterations) from the encryption code,
+ * then POSTed as ciphertext. A network listener sees only random bytes.
+ */
+var VAULT_AAD_PREFIX = "erin-vault/serve-store/v1:";
+var VAULT_PBKDF2_ITERS = 600000;
+var VAULT_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+var CRED_NAME = __CRED_NAME_JS__;
+var VEC = {
+  sha256_abc: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  pbkdf2_2000: "9209a0c90243e88b89488f99cd7ea010c244cc7a9d4bf65c157f2d8f642eb952",
+  chacha_key: "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+  chacha_nonce: "070000004041424344454647",
+  chacha_aad: "6572696e2d7661756c742d766563746f722d616164",
+  chacha_pt: "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f67202d20766563746f72207633",
+  chacha_ct: "cb138c7d708829d97ec2ed8959f6648ea7aff01f637403aeaeaabff130f023d126fbeb54cdf4270bdcb5d52fd7fb248d1670dd1c9e1f5eb55a15dba270e0b582933841510b9dc0",
+  aes_code: "testcode123",
+  aes_salt: "000102030405060708090a0b0c0d0e0f",
+  aes_iv: "000102030405060708090a0b",
+  aes_aad: "6572696e2d7661756c742f73657276652d73746f72652f76313a73656c6674657374",
+  aes_pt: "6572696e2d7661756c742d73656c66746573742d7631",
+  aes_ct: "7bd6bd0c93d7ed14a486c92379aef27b8cba7f9bc6577066de1fc36173ed5e353c2b30cd5d8c"
+};
+var VAULT_SUITE = null;
+
+function va_normCode(s){
+  s = (s || "").toLowerCase();
+  var o = "";
+  for (var i = 0; i < s.length; i++)
+    if (VAULT_CODE_ALPHABET.indexOf(s[i]) >= 0) o += s[i];
+  return o;
+}
+
+async function va_wcEncrypt(codeNorm, salt, iv, aad, plaintext){
+  var te = new TextEncoder();
+  var baseKey = await crypto.subtle.importKey("raw", te.encode(codeNorm), "PBKDF2", false, ["deriveKey"]);
+  var key = await crypto.subtle.deriveKey(
+    {name: "PBKDF2", salt: salt, iterations: VAULT_PBKDF2_ITERS, hash: "SHA-256"},
+    baseKey, {name: "AES-GCM", length: 256}, false, ["encrypt"]);
+  var out = await crypto.subtle.encrypt(
+    {name: "AES-GCM", iv: iv, additionalData: aad}, key, plaintext);
+  return new Uint8Array(out);
+}
+
+async function va_selfTest(){
+  try {
+    if (va_bytesHex(va_sha256(va_ascii("abc"))) !== VEC.sha256_abc) return false;
+    if (va_bytesHex(va_pbkdf2(va_ascii("password"), va_ascii("salt"), 2000, 32)) !== VEC.pbkdf2_2000) return false;
+    var d = va_aeadDecrypt(
+      va_hexBytes(VEC.chacha_key), va_hexBytes(VEC.chacha_nonce), va_hexBytes(VEC.chacha_aad),
+      va_hexBytes(VEC.chacha_ct.substring(0, VEC.chacha_ct.length - 32)),
+      va_hexBytes(VEC.chacha_ct.substring(VEC.chacha_ct.length - 32)));
+    if (!d || !va_eq(d, va_hexBytes(VEC.chacha_pt))) return false;
+    if (window.crypto && crypto.subtle) {
+      var ct = await va_wcEncrypt(VEC.aes_code, va_hexBytes(VEC.aes_salt), va_hexBytes(VEC.aes_iv),
+        va_hexBytes(VEC.aes_aad), va_hexBytes(VEC.aes_pt));
+      if (va_bytesHex(ct) !== VEC.aes_ct) return false;
+      VAULT_SUITE = "aesgcm-v1";
+    } else {
+      var salt = va_random(16), iv = va_random(12);
+      var key = va_pbkdf2(va_ascii("selftest-code"), salt, 2000, 32);
+      var aad = va_ascii(VAULT_AAD_PREFIX + "selftest");
+      var pt = va_ascii("selftest-ok");
+      var r = va_aeadEncrypt(key, iv, aad, pt);
+      var back = va_aeadDecrypt(key, iv, aad, r.ct, r.tag);
+      if (!back || !va_eq(back, pt)) return false;
+      VAULT_SUITE = "chacha-v1";
+    }
+    return true;
+  } catch (e) { return false; }
+}
+
+function va_setStatus(msg, isErr){
+  var el = document.getElementById("status");
+  el.textContent = msg;
+  el.style.color = isErr ? "#b00020" : "#333";
+}
+
+async function va_doSubmit(ev){
+  ev.preventDefault();
+  var code = va_normCode(document.getElementById("code").value);
+  var username = document.getElementById("username").value;
+  var password = document.getElementById("password").value;
+  if (!password) { va_setStatus("Enter the password.", true); return false; }
+  if (code.length < 12) { va_setStatus("Enter the full encryption code your agent gave you.", true); return false; }
+  var btn = document.getElementById("submitBtn");
+  btn.disabled = true;
+  btn.textContent = "Encrypting…";
+  va_setStatus("Encrypting in your browser…", false);
+  try {
+    var te = new TextEncoder();
+    var salt = va_random(16), iv = va_random(12);
+    var aad = va_ascii(VAULT_AAD_PREFIX + CRED_NAME);
+    var payload = te.encode(JSON.stringify({u: username, p: password}));
+    var ctBytes;
+    if (VAULT_SUITE === "aesgcm-v1") {
+      ctBytes = await va_wcEncrypt(code, salt, iv, aad, payload);
+    } else {
+      var key = va_pbkdf2(va_ascii(code), salt, VAULT_PBKDF2_ITERS, 32);
+      var r = va_aeadEncrypt(key, iv, aad, payload);
+      ctBytes = va_concat([r.ct, r.tag]);
+    }
+    var body = JSON.stringify({suite: VAULT_SUITE,
+      salt: va_b64encode(salt), iv: va_b64encode(iv), ct: va_b64encode(ctBytes)});
+    var resp = await fetch("submit", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: body});
+    if (resp.ok) {
+      document.body.innerHTML = '<div style="font-family:sans-serif;text-align:center;margin-top:100px"><h2>Stored securely.</h2><p>The server has shut down. You can close this page.</p></div>';
+    } else {
+      btn.disabled = false;
+      btn.textContent = "Store Securely (encrypted)";
+      va_setStatus("Wrong encryption code or corrupted data — check the code and try again.", true);
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "Store Securely (encrypted)";
+    va_setStatus("Encryption failed: " + (e && e.message ? e.message : e), true);
+  }
+  return false;
+}
+
+va_selfTest().then(function(ok){
+  var btn = document.getElementById("submitBtn");
+  var note = document.getElementById("suiteNote");
+  if (ok) {
+    btn.disabled = false;
+    btn.textContent = "Store Securely (encrypted)";
+    note.textContent = VAULT_SUITE === "aesgcm-v1"
+      ? "End-to-end encrypted in your browser (AES-256-GCM). The server never sees your plaintext password."
+      : "End-to-end encrypted in your browser (ChaCha20-Poly1305). The server never sees your plaintext password.";
+  } else {
+    va_setStatus("Security self-test failed — refusing to submit. Do not enter your password.", true);
+  }
+});
+document.getElementById("theForm").addEventListener("submit", va_doSubmit);
+"""
+
+
+_PAGE_HTML = """<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ERIN Vault — __CRED_NAME_HTML__</title></head>
+<body style="font-family:sans-serif;max-width:400px;margin:40px auto;padding:20px">
+<h2>Store credential: __CRED_NAME_HTML__</h2>
+<p style="color:#666;font-size:14px">Your password is <b>encrypted in this browser</b>
+with the encryption code before it travels anywhere. It is never sent or stored
+in plaintext, and your agent never sees it.</p>
+<form id="theForm">
+<label>Encryption code (from your agent):<br>
+<input type="text" id="code" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required placeholder="xxxx-xxxx-xxxx" style="width:100%;padding:10px;margin:5px 0;font-family:monospace"></label><br>
+<label>Username/email (optional):<br>
+<input type="text" id="username" autocomplete="username" style="width:100%;padding:10px;margin:5px 0"></label><br>
+<label>Password:<br>
+<input type="password" id="password" required autocomplete="new-password" style="width:100%;padding:10px;margin:5px 0"></label><br><br>
+<button id="submitBtn" type="submit" disabled style="padding:12px 30px;font-size:16px">Checking security…</button>
+</form>
+<p id="suiteNote" style="color:#666;font-size:13px"></p>
+<p id="status" style="font-size:14px"></p>
+<script>
+__PAGE_JS__
+</script>
+</body></html>
+"""
+
+
+def _build_page(name):
+    import html as _html
+    js = _PAGE_JS.replace("__CRED_NAME_JS__", json.dumps(name))
+    page = _PAGE_HTML.replace("__PAGE_JS__", _VCRYPT_JS + "\n" + js)
+    return page.replace("__CRED_NAME_HTML__", _html.escape(name))
+
+
+def _new_code():
+    """One-time encryption code: 12 unambiguous chars (~60 bits), grouped."""
+    import secrets
+    raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+    return "-".join(raw[i:i + 4] for i in range(0, CODE_LEN, 4))
+
+
+def _norm_code(s):
+    return "".join(c for c in s.lower() if c in CODE_ALPHABET)
+
+
+def _derive_code_key(code_norm, salt):
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    return PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt,
+        iterations=PBKDF2_ITERS,
+    ).derive(code_norm.encode())
+
+
+def _decrypt_submit(suite, code_norm, name, salt, iv, ct):
+    """Decrypt a serve-store submission. Raises on wrong code / tampering."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+    key = _derive_code_key(code_norm, salt)
+    aad = AAD_PREFIX + name.encode()
+    if suite == "aesgcm-v1":
+        return AESGCM(key).decrypt(iv, ct, aad)
+    if suite == "chacha-v1":
+        return ChaCha20Poly1305(key).decrypt(iv, ct, aad)
+    raise ValueError("unknown suite")
 
 
 def _run_security(args):
@@ -217,98 +680,113 @@ def cmd_delete(name):
 
 
 def cmd_serve_store(name, port=18443, bind="127.0.0.1"):
+    """One-time local web form with END-TO-END encryption.
+
+    The browser encrypts the password (PBKDF2-SHA256 600k -> AES-256-GCM, or
+    a verified ChaCha20-Poly1305 fallback) with a one-time encryption code
+    before anything travels. A passive network listener sees only
+    ciphertext; the code itself travels via the agent's chat, a separate
+    channel. Binds localhost by default. Shuts down after one successful
+    submission, 25 failed attempts, or 10 minutes.
     """
-    One-time local web server for credential entry from another device.
-    Binds localhost by default. Auto-shutdown after one submission or 10 min.
-    Plain HTTP is safe on localhost; on a private mesh network (Tailscale /
-    WireGuard via --bind) the tunnel itself provides encryption.
-    """
-    import secrets
     from http.server import BaseHTTPRequestHandler, HTTPServer
-    from urllib.parse import urlparse, parse_qs
 
-    # 6-digit PIN: short enough for a human/agent to relay accurately.
-    token = str(secrets.randbelow(900000) + 100000)
-
-    result_holder = {}
+    enc_code = _new_code()
+    code_norm = _norm_code(enc_code)
+    failed = [0]
+    result = {}
+    page = _build_page(name)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
-            pass  # Suppress logging (URLs contain the one-time token)
+            pass  # no logging: URLs/bodies are sensitive
+
+        def _reply(self, status, body, ctype="text/html"):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def do_GET(self):
-            q = parse_qs(urlparse(self.path).query)
-            if q.get("token", [None])[0] != token:
-                self.send_response(403)
-                self.end_headers()
+            if self.path not in ("/", "/index.html"):
+                self._reply(404, "Not found", "text/plain")
                 return
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(f"""<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ERIN Vault</title></head>
-<body style="font-family:sans-serif;max-width:400px;margin:40px auto;padding:20px">
-<h2>Store credential: {name}</h2>
-<p style="color:#666;font-size:14px">This value goes straight into the encrypted
-vault on this machine. It is never shown to anyone, including your AI agent.</p>
-<form method="POST" action="/submit?token={token}">
-<label>Username/email (optional):<br>
-<input type="text" name="username" autocomplete="username" style="width:100%;padding:10px;margin:5px 0"></label><br>
-<label>Password:<br>
-<input type="password" name="value" required autocomplete="new-password" style="width:100%;padding:10px;margin:5px 0"></label><br><br>
-<button type="submit" style="padding:12px 30px;font-size:16px">Store Securely</button>
-</form></body></html>""".encode())
+            self._reply(200, page)
 
         def do_POST(self):
-            q = parse_qs(urlparse(self.path).query)
-            if q.get("token", [None])[0] != token:
-                self.send_response(403)
-                self.end_headers()
+            if self.path != "/submit":
+                self._reply(404, "Not found", "text/plain")
                 return
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode()
-            params = parse_qs(body)
-            username = params.get("username", [""])[0].strip() or None
-            value = params.get("value", [""])[0]
-            if not value:
-                self.send_response(400)
-                self.end_headers()
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 65536:
+                self._reply(400, "Bad request", "text/plain")
                 return
-            result_holder["username"] = username
-            result_holder["value"] = value
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"""<!DOCTYPE html>
-<html><body style="font-family:sans-serif;text-align:center;margin-top:100px">
-<h2>Stored securely.</h2><p>You can close this page.</p></body></html>""")
+            try:
+                data = json.loads(self.rfile.read(length).decode())
+                suite = data["suite"]
+                salt = base64.b64decode(data["salt"])
+                iv = base64.b64decode(data["iv"])
+                ct = base64.b64decode(data["ct"])
+                if suite not in SUITES:
+                    raise ValueError("suite")
+                if len(salt) != 16 or len(iv) != 12 or not (0 < len(ct) <= 8192):
+                    raise ValueError("sizes")
+            except Exception:
+                self._reply(400, "Bad request", "text/plain")
+                return
+            try:
+                raw = _decrypt_submit(suite, code_norm, name, salt, iv, ct)
+                payload = json.loads(raw.decode("utf-8"))
+                password = payload["p"]
+                username = payload.get("u") or None
+                if not isinstance(password, str) or not password:
+                    raise ValueError("payload")
+                if username is not None and not isinstance(username, str):
+                    raise ValueError("payload")
+            except Exception:
+                failed[0] += 1
+                if failed[0] >= SERVE_MAX_FAILS:
+                    result["abort"] = True
+                    self._reply(403, "Too many failed attempts.", "text/plain")
+                else:
+                    self._reply(400, "Invalid encryption code.", "text/plain")
+                return
+            result["username"] = username
+            result["password"] = password
+            self._reply(200, "Stored.")
 
     server = HTTPServer((bind, port), Handler)
     server.timeout = 1.0
 
-    url = f"http://{bind}:{port}/?token={token}"
-    print(f"VAULT_URL:{url}")
-    print(f"VAULT_PIN:{token}", flush=True)
-    print("Token valid for one submission or 10 minutes.", flush=True)
+    url = f"http://{bind}:{port}/"
+    print(f"VAULT_URL:{url}", flush=True)
+    print(f"VAULT_CODE:{enc_code}", flush=True)
+    print("End-to-end encrypted: the password is encrypted in the browser with this code")
+    print("before it travels. Relay the URL and the code to the human.")
+    print(f"Server shuts down after one successful submission, {SERVE_MAX_FAILS} failed")
+    print(f"attempts, or {SERVE_TIMEOUT_SECS // 60} minutes.")
 
     start = time.time()
-    while time.time() - start < 600:  # 10 min timeout
+    while time.time() - start < SERVE_TIMEOUT_SECS:
         server.handle_request()
-        if "value" in result_holder:
+        if "password" in result or "abort" in result:
             break
 
     server.server_close()
 
-    if "value" not in result_holder:
-        print("Timed out, no credential stored.", file=sys.stderr)
+    if "password" not in result:
+        print("No credential stored.", file=sys.stderr)
         sys.exit(1)
 
-    _store_entry(name, result_holder["username"], result_holder["value"])
-    # Clear the value from memory
-    result_holder["value"] = "x" * len(result_holder["value"])
-    del result_holder["value"]
-    print(f"'{name}' stored securely via web form.")
+    _store_entry(name, result["username"], result["password"])
+    result["password"] = "x" * len(result["password"])
+    del result["password"]
+    print(f"'{name}' stored securely via encrypted web form.")
 
 
 def _filter_secrets(data: bytes, secrets_list) -> bytes:
