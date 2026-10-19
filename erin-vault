@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""
+ERIN Vault v1.0.0 — local-only encrypted credential broker for AI agents.
+
+The problem: your AI agent needs to run authenticated commands (log in to
+developer accounts, sign builds, hit private APIs), but you don't want to
+paste passwords into a chat window where they'd be logged, or hand the agent
+raw secrets it might echo back.
+
+The fix: store each credential once, encrypted on your own machine. The agent
+triggers commands through the vault; the vault injects the secret into the
+command's prompts inside a PTY and filters the value out of all output before
+the agent ever sees it. The agent never sees, logs, or stores your passwords.
+
+Commands:
+    erin-vault store <name> [--username U]
+        Store a credential via hidden terminal prompts (double-entry confirm).
+
+    erin-vault serve-store <name> [--port P] [--bind ADDR]
+        One-time local web form for credential entry from another device.
+        Prints a URL + 6-digit PIN; hand both to your agent, or open the URL
+        yourself. The value goes straight into the encrypted vault; the server
+        shuts down after one submission or 10 minutes. Binds 127.0.0.1
+        (localhost) by default — nothing leaves the machine. To enter from a
+        phone, re-run with --bind set to this machine's private-network IP
+        (e.g. its Tailscale address).
+
+    erin-vault list
+        List stored credential names (never values).
+
+    erin-vault delete <name>
+        Remove a credential.
+
+    erin-vault run <name> [--username U] [--2fa-pipe P] -- <command...>
+        Run a command in a PTY; inject the username on identity prompts and
+        the credential on password prompts; filter both from all output.
+        2FA: the vault signals it needs a code and waits for the agent to
+        write the code to the --2fa-pipe path, then injects and deletes it.
+
+Local-only guarantee: the encrypted database (~/.erin-vault/vault.enc) and
+the master key (macOS Keychain, or a 0600 file elsewhere) never leave this
+machine. This script makes zero outbound network connections — the only
+socket it ever opens is the optional serve-store listener, which defaults to
+localhost. See docs/THREAT_MODEL.md.
+"""
+
+import base64
+import getpass
+import json
+import os
+import pty
+import re
+import select
+import sys
+import time
+
+VERSION = "1.0.0"
+
+VAULT_DIR = os.path.expanduser("~/.erin-vault")
+VAULT_FILE = os.path.join(VAULT_DIR, "vault.enc")
+KEY_FILE = os.path.join(VAULT_DIR, ".master-key")
+KEYCHAIN_SERVICE = "erin-vault"
+KEYCHAIN_ACCOUNT = "master-key"
+TWOFA_MARKER = "/tmp/erin-vault-2fa-needed"
+
+# App-specific prompt handlers: (regex, reply, note).
+# Checked in order, each fires at most once per `run` invocation, before the
+# generic username/password handlers below. These examples drive Apple's /
+# EAS interactive prompts; replace them with your own tools' prompts.
+EXTRA_PROMPT_HANDLERS = [
+    (r"do you want to log in to your apple", "y",
+     "EAS: allow Apple account login"),
+    (r"reuse this distribution certificate", "y",
+     "EAS: reuse existing distribution certificate"),
+    (r"generate a new apple provisioning profile", "y",
+     "EAS: reuse existing provisioning profile"),
+    (r"would you like to reuse the original profile", "y",
+     "EAS: reuse original provisioning profile"),
+]
+
+
+def _run_security(args):
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["security"] + args, capture_output=True, text=True, timeout=10
+        )
+        return result
+    except (FileNotFoundError, OSError):
+        # No `security` CLI (Linux, minimal macOS env): Keychain unavailable.
+        class _Failed:
+            returncode = 1
+            stdout = ""
+            stderr = ""
+        return _Failed()
+
+
+def get_or_create_master_key():
+    # Check the fallback file FIRST. Over SSH the macOS Keychain is usually
+    # locked ("User interaction is not allowed"); if we asked the Keychain
+    # first while it was unlocked-but-empty we'd mint a second, different key
+    # and permanently break decryption of the existing vault.
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "r") as f:
+            return f.read().strip()
+
+    # Try macOS Keychain
+    r = _run_security([
+        "find-generic-password", "-s", KEYCHAIN_SERVICE,
+        "-a", KEYCHAIN_ACCOUNT, "-w"
+    ])
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+
+    # Mint a new key and try to store it in the Keychain
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key().decode()
+    r = _run_security([
+        "add-generic-password", "-s", KEYCHAIN_SERVICE,
+        "-a", KEYCHAIN_ACCOUNT, "-w", key, "-U"
+    ])
+    if r.returncode == 0:
+        print("Master key created in macOS Keychain.")
+        return key
+
+    # Keychain unavailable (headless/SSH/Linux) — 0600 key file instead.
+    os.makedirs(VAULT_DIR, mode=0o700, exist_ok=True)
+    with open(KEY_FILE, "w") as f:
+        f.write(key)
+    os.chmod(KEY_FILE, 0o600)
+    print("Master key stored in secure local file.")
+    return key
+
+
+def get_fernet():
+    from cryptography.fernet import Fernet
+    return Fernet(get_or_create_master_key().encode())
+
+
+def load_vault():
+    if not os.path.exists(VAULT_FILE):
+        return {}
+    with open(VAULT_FILE, "rb") as f:
+        encrypted = f.read()
+    try:
+        return json.loads(get_fernet().decrypt(encrypted))
+    except Exception as e:
+        print(f"Vault decrypt failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def save_vault(data):
+    os.makedirs(VAULT_DIR, mode=0o700, exist_ok=True)
+    encrypted = get_fernet().encrypt(json.dumps(data).encode())
+    with open(VAULT_FILE, "wb") as f:
+        f.write(encrypted)
+    os.chmod(VAULT_FILE, 0o600)
+
+
+def _secure_delete_var(name, namespace):
+    """Best-effort memory clearing (defense-in-depth; CPython strings are
+    immutable, so this only overwrites the reference)."""
+    if name in namespace:
+        val = namespace[name]
+        if isinstance(val, str):
+            namespace[name] = "x" * len(val)
+        del namespace[name]
+
+
+def _store_entry(name, username, value):
+    vault = load_vault()
+    vault[name] = {
+        "username": username,
+        "value": base64.b64encode(value.encode()).decode(),
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    save_vault(vault)
+
+
+def cmd_store(name, username=None):
+    print(f"Storing credential '{name}'.")
+    if username:
+        print(f"Username: {username}")
+    else:
+        username = input("Username/email (or Enter to skip): ").strip() or None
+    value = getpass.getpass("Password/value (hidden): ")
+    if not value:
+        print("Empty, aborting.", file=sys.stderr)
+        sys.exit(1)
+    if getpass.getpass("Confirm: ") != value:
+        print("Mismatch, aborting.", file=sys.stderr)
+        sys.exit(1)
+
+    _store_entry(name, username, value)
+    _secure_delete_var("value", locals())
+    print(f"'{name}' stored securely.")
+
+
+def cmd_list():
+    vault = load_vault()
+    if not vault:
+        print("No credentials stored.")
+        return
+    for name, meta in vault.items():
+        u = f" (user: {meta.get('username', 'n/a')})" if meta.get("username") else ""
+        print(f"  {name}{u} — stored {meta.get('created', '?')}")
+
+
+def cmd_delete(name):
+    vault = load_vault()
+    if name not in vault:
+        print(f"'{name}' not found.", file=sys.stderr)
+        sys.exit(1)
+    del vault[name]
+    save_vault(vault)
+    print(f"'{name}' deleted.")
+
+
+def cmd_serve_store(name, port=18443, bind="127.0.0.1"):
+    """
+    One-time local web server for credential entry from another device.
+    Binds localhost by default. Auto-shutdown after one submission or 10 min.
+    Plain HTTP is safe on localhost; on a private mesh network (Tailscale /
+    WireGuard via --bind) the tunnel itself provides encryption.
+    """
+    import secrets
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import urlparse, parse_qs
+
+    # 6-digit PIN: short enough for a human/agent to relay accurately.
+    token = str(secrets.randbelow(900000) + 100000)
+
+    result_holder = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass  # Suppress logging (URLs contain the one-time token)
+
+        def do_GET(self):
+            q = parse_qs(urlparse(self.path).query)
+            if q.get("token", [None])[0] != token:
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(f"""<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ERIN Vault</title></head>
+<body style="font-family:sans-serif;max-width:400px;margin:40px auto;padding:20px">
+<h2>Store credential: {name}</h2>
+<p style="color:#666;font-size:14px">This value goes straight into the encrypted
+vault on this machine. It is never shown to anyone, including your AI agent.</p>
+<form method="POST" action="/submit?token={token}">
+<label>Username/email (optional):<br>
+<input type="text" name="username" autocomplete="username" style="width:100%;padding:10px;margin:5px 0"></label><br>
+<label>Password:<br>
+<input type="password" name="value" required autocomplete="new-password" style="width:100%;padding:10px;margin:5px 0"></label><br><br>
+<button type="submit" style="padding:12px 30px;font-size:16px">Store Securely</button>
+</form></body></html>""".encode())
+
+        def do_POST(self):
+            q = parse_qs(urlparse(self.path).query)
+            if q.get("token", [None])[0] != token:
+                self.send_response(403)
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode()
+            params = parse_qs(body)
+            username = params.get("username", [""])[0].strip() or None
+            value = params.get("value", [""])[0]
+            if not value:
+                self.send_response(400)
+                self.end_headers()
+                return
+            result_holder["username"] = username
+            result_holder["value"] = value
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"""<!DOCTYPE html>
+<html><body style="font-family:sans-serif;text-align:center;margin-top:100px">
+<h2>Stored securely.</h2><p>You can close this page.</p></body></html>""")
+
+    server = HTTPServer((bind, port), Handler)
+    server.timeout = 1.0
+
+    url = f"http://{bind}:{port}/?token={token}"
+    print(f"VAULT_URL:{url}")
+    print(f"VAULT_PIN:{token}", flush=True)
+    print("Token valid for one submission or 10 minutes.", flush=True)
+
+    start = time.time()
+    while time.time() - start < 600:  # 10 min timeout
+        server.handle_request()
+        if "value" in result_holder:
+            break
+
+    server.server_close()
+
+    if "value" not in result_holder:
+        print("Timed out, no credential stored.", file=sys.stderr)
+        sys.exit(1)
+
+    _store_entry(name, result_holder["username"], result_holder["value"])
+    # Clear the value from memory
+    result_holder["value"] = "x" * len(result_holder["value"])
+    del result_holder["value"]
+    print(f"'{name}' stored securely via web form.")
+
+
+def _filter_secrets(data: bytes, secrets_list) -> bytes:
+    """Remove credential values from output before it reaches the caller."""
+    for s in secrets_list:
+        if s and len(s) >= 4:
+            data = data.replace(s.encode(), b"[REDACTED]")
+    return data
+
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", text)
+
+
+def cmd_run(name, command_args, override_username=None, twofa_pipe=None):
+    vault = load_vault()
+    if name not in vault:
+        print(f"'{name}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    entry = vault[name]
+    password = base64.b64decode(entry["value"]).decode()
+    username = override_username or entry.get("username")
+    del vault, entry
+
+    secrets_to_filter = [password]
+    if username:
+        secrets_to_filter.append(username)
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp(command_args[0], command_args)
+
+    fired_handlers = set()
+    username_sent = False
+    password_sent = False
+    twofa_sent = False
+    output_buffer = b""
+
+    for f in [TWOFA_MARKER, twofa_pipe or ""]:
+        try:
+            if f:
+                os.unlink(f)
+        except OSError:
+            pass
+
+    try:
+        while True:
+            r, _, _ = select.select([fd], [], [], 1.0)
+            if fd in r:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                # FILTER secrets before echoing to caller
+                filtered = _filter_secrets(data, secrets_to_filter)
+                sys.stdout.buffer.write(filtered)
+                sys.stdout.buffer.flush()
+
+                output_buffer += data
+                if len(output_buffer) > 16384:
+                    output_buffer = output_buffer[-16384:]
+                text = _strip_ansi(output_buffer.decode(errors="replace"))
+
+                handled = False
+
+                # App-specific handlers (each fires once)
+                for i, (pattern, reply, note) in enumerate(EXTRA_PROMPT_HANDLERS):
+                    if i not in fired_handlers and re.search(pattern, text, re.IGNORECASE):
+                        time.sleep(0.3)
+                        os.write(fd, (reply + "\r").encode())
+                        fired_handlers.add(i)
+                        output_buffer = b""
+                        print(f"\n[erin-vault: answered prompt ({note})]", flush=True)
+                        handled = True
+                        break
+
+                if handled:
+                    continue
+
+                # Username / identity prompt (before password)
+                if username and not username_sent and re.search(
+                    r"(apple\s*id|username|email|login)", text, re.IGNORECASE
+                ):
+                    time.sleep(0.3)
+                    os.write(fd, (username + "\r").encode())
+                    username_sent = True
+                    output_buffer = b""
+                    print("\n[erin-vault: username injected]", flush=True)
+
+                # Password prompt
+                elif not password_sent and re.search(r"password", text, re.IGNORECASE):
+                    time.sleep(0.5)
+                    os.write(fd, (password + "\r").encode())
+                    password_sent = True
+                    output_buffer = b""
+                    print("\n[erin-vault: credential injected]", flush=True)
+
+                # 2FA prompt
+                elif password_sent and not twofa_sent and twofa_pipe and re.search(
+                    r"(verification\s*code|2fa|two.?factor|6.?digit|authenticator|one.?time)",
+                    text, re.IGNORECASE
+                ):
+                    with open(TWOFA_MARKER, "w") as f:
+                        f.write("needed")
+                    os.chmod(TWOFA_MARKER, 0o600)
+                    print("\n[erin-vault: 2FA code needed — waiting...]", flush=True)
+                    waited = 0
+                    while waited < 300:
+                        if os.path.exists(twofa_pipe):
+                            with open(twofa_pipe) as f:
+                                code = f.read().strip()
+                            if code:
+                                os.unlink(twofa_pipe)
+                                try:
+                                    os.unlink(TWOFA_MARKER)
+                                except OSError:
+                                    pass
+                                os.write(fd, (code + "\r").encode())
+                                twofa_sent = True
+                                output_buffer = b""
+                                print("[erin-vault: 2FA injected]", flush=True)
+                                code = "x" * len(code)
+                                break
+                        time.sleep(2)
+                        waited += 2
+    finally:
+        _secure_delete_var("password", locals())
+        try:
+            os.unlink(TWOFA_MARKER)
+        except OSError:
+            pass
+
+    _, status = os.waitpid(pid, 0)
+    exit_code = os.waitstatus_to_exitcode(status)
+    print(f"\n[erin-vault: exited {exit_code}]", flush=True)
+    sys.exit(exit_code)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    cmd = sys.argv[1]
+
+    if cmd == "--version":
+        print(f"erin-vault {VERSION}")
+    elif cmd == "store" and len(sys.argv) >= 3:
+        # erin-vault store <name> [--username U]
+        name = sys.argv[2]
+        username = None
+        if "--username" in sys.argv:
+            username = sys.argv[sys.argv.index("--username") + 1]
+        cmd_store(name, username)
+    elif cmd == "serve-store" and len(sys.argv) >= 3:
+        # erin-vault serve-store <name> [--port P] [--bind ADDR]
+        name = sys.argv[2]
+        port = 18443
+        bind = "127.0.0.1"
+        if "--port" in sys.argv:
+            port = int(sys.argv[sys.argv.index("--port") + 1])
+        if "--bind" in sys.argv:
+            bind = sys.argv[sys.argv.index("--bind") + 1]
+        cmd_serve_store(name, port, bind)
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "delete" and len(sys.argv) == 3:
+        cmd_delete(sys.argv[2])
+    elif cmd == "run":
+        args = sys.argv[2:]
+        if not args:
+            print("Usage: erin-vault run <name> [--username U] [--2fa-pipe P] -- <cmd>",
+                  file=sys.stderr)
+            sys.exit(1)
+        name = args[0]
+        args = args[1:]
+        username = None
+        twofa_pipe = None
+        if "--username" in args:
+            idx = args.index("--username")
+            username = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+        if "--2fa-pipe" in args:
+            idx = args.index("--2fa-pipe")
+            twofa_pipe = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+            d = os.path.dirname(twofa_pipe) or "."
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        if args and args[0] == "--":
+            args = args[1:]
+        if not args:
+            print("No command.", file=sys.stderr)
+            sys.exit(1)
+        cmd_run(name, args, username, twofa_pipe)
+    else:
+        print(f"Unknown: {cmd}", file=sys.stderr)
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
